@@ -766,7 +766,7 @@ class ListGenerator:
     @staticmethod
     def generate_list_string(reminders: List[Dict[str, Any]]) -> str:
         """
-        生成带连续序号的提醒和任务列表字符串
+        生成带连续序号的提醒和任务列表字符串，包含重复情况
 
         Args:
             reminders: 提醒和任务列表
@@ -786,20 +786,47 @@ class ListGenerator:
         if reminders_list:
             all_items_str.append("\n提醒列表：")
             for r in reminders_list:
-                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']})")
+                repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
+                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]")
                 current_index += 1
 
         if tasks_list:
             all_items_str.append("\n任务列表：")
             for r in tasks_list:
-                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']})")
+                repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
+                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]")
                 current_index += 1
 
         if command_tasks_list:
             all_items_str.append("\n指令任务列表：")
             for r in command_tasks_list:
                 command_text = r['text']
-                all_items_str.append(f"{current_index}. {command_text} (时间: {r['datetime']})")
+                repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
+                all_items_str.append(f"{current_index}. {command_text} (时间: {r['datetime']}) [{repeat_info}]")
                 current_index += 1
         
         return "\n".join(all_items_str)
+    
+    @staticmethod
+    def _get_repeat_description(repeat_str: str) -> str:
+        """
+        获取重复类型的描述
+        
+        Args:
+            repeat_str: 重复类型字符串
+            
+        Returns:
+            str: 重复类型描述
+        """
+        if not repeat_str or repeat_str == "none":
+            return "一次性"
+        
+        # 处理带节假日类型的重复
+        if "_" in repeat_str:
+            parts = repeat_str.split("_")
+            if len(parts) == 2:
+                repeat_type, holiday_type = parts
+                return RepeatDescriptionGenerator.generate_repeat_description(repeat_type, holiday_type)
+        
+        # 处理普通重复类型
+        return RepeatDescriptionGenerator.generate_repeat_description(repeat_str)
