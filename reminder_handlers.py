@@ -246,6 +246,7 @@ class TaskExecutor:
         # 添加常用的reply方法
         if not hasattr(event, "reply"):
             async def reply_func(content):
+                # 这个属性现在不再用于控制流程，但为了兼容可能依赖它的旧函数，暂时保留
                 event._has_send_oper = True
                 msg_chain = MessageChain()
                 if isinstance(content, str):
@@ -385,6 +386,7 @@ class TaskExecutor:
         
         # 添加特殊属性，供函数调用时使用
         event._send_session_id = send_session_id
+        # 这个属性现在不再用于控制流程，但为了兼容可能依赖它的旧函数，暂时保留
         event._has_send_oper = False
         
         # 添加平台辅助工具到消息对象
@@ -411,75 +413,73 @@ class TaskExecutor:
         try:
             # 获取对话上下文
             original_msg_origin = self.message_handler.get_original_session_id(unified_msg_origin)
-            curr_cid = await self.context.conversation_manager.get_curr_conversation_id(original_msg_origin)
+            curr_cid = None
             conversation = None
             contexts = []
             
             if enable_context:
+                curr_cid = await self.context.conversation_manager.get_curr_conversation_id(original_msg_origin)
                 if curr_cid:
                     conversation = await self.context.conversation_manager.get_conversation(original_msg_origin, curr_cid)
                     if conversation:
                         contexts = json.loads(conversation.history)
                         logger.info(f"任务模式：找到用户对话，对话ID: {curr_cid}, 上下文长度: {len(contexts)}")
                 
-                # 如果没有对话或需要新建对话
                 if not curr_cid or not conversation:
                     curr_cid = await self.context.conversation_manager.new_conversation(original_msg_origin)
                     conversation = await self.context.conversation_manager.get_conversation(original_msg_origin, curr_cid)
                     logger.info(f"创建新对话，对话ID: {curr_cid}")
             
-            # 检查是否是调用LLM函数的任务
+            # 构造初始上下文和Prompt
+            new_contexts = contexts.copy()
+            new_contexts.append({"role": "user", "content": task_text})
+
+            prompt = f"请执行以下任务：{task_text}。请直接执行，不要提及这是一个预设任务。"
             if task_text.startswith("请调用") and "函数" in task_text:
                 prompt = f"用户请求你执行以下操作：{task_text}。请直接执行这个任务，不要解释你在做什么，就像用户刚刚发出这个请求一样。"
-            else:
-                # 普通任务，直接让AI执行
-                prompt = f"请执行以下任务：{task_text}。请直接执行，不要提及这是一个预设任务。"
             
             logger.info(f"发送提示词到LLM: {prompt[:50]}...")
             
-            # 添加系统提示词，确保LLM知道它可以调用函数
             system_prompt = "你可以调用各种函数来帮助用户完成任务，如获取天气、设置提醒等。请根据用户的需求直接调用相应的函数。"
             
-            # 直接调用LLM，获取响应后手动处理
+            # 调用LLM
             response = await provider.text_chat(
                 prompt=prompt,
                 session_id=unified_msg_origin,
-                contexts=contexts[:max_context_count] if contexts and enable_context else [],  # 根据配置使用上下文
-                func_tool=func_tool,  # 添加函数工具管理器，让AI可以调用LLM函数
-                system_prompt=system_prompt  # 添加系统提示词
+                contexts=contexts[:max_context_count] if contexts and enable_context else [],
+                func_tool=func_tool,
+                system_prompt=system_prompt
             )
             
             logger.info(f"LLM响应类型: {response.role}")
             
-            # 记录用户操作到历史，先添加用户的提问到历史记录
-            new_contexts = contexts.copy()
-            new_contexts.append({"role": "user", "content": task_text})
-            
-            # 标记是否需要发送结果给用户
-            need_send_result = True
             result_msg = MessageChain()
             
             # 检查是否有工具调用
             if response.role == "tool" and hasattr(response, 'tools_call_name') and response.tools_call_name:
-                need_send_result = await self._handle_tool_calls(response, func_tool, task_text, unified_msg_origin, reminder, 
-                                            new_contexts, result_msg, need_send_result)
+                # 统一处理工具调用，此函数现在负责更新上下文并返回工具的原始结果
+                tool_results = await self._handle_tool_calls(response, func_tool, task_text, unified_msg_origin, reminder, new_contexts)
+                
+                # 基于工具结果，生成最终回复
+                final_reply_text = await self._process_tool_results(tool_results, task_text, unified_msg_origin)
+                result_msg.chain.append(Plain(final_reply_text))
+                new_contexts.append({"role": "assistant", "content": final_reply_text})
+
             elif response.role == "assistant" and response.completion_text:
-                # 如果只有文本回复，构建普通消息
+                # 如果只有文本回复，直接使用
                 result_msg.chain.append(Plain(response.completion_text))
-                # 添加AI的回复到历史记录
                 new_contexts.append({"role": "assistant", "content": response.completion_text})
             else:
                 # 没有文本回复也没有工具调用，返回默认消息
-                result_msg.chain.append(Plain("任务执行完成，但未返回结果。"))
-                # 添加结果到历史记录
-                new_contexts.append({"role": "assistant", "content": "任务执行完成，但未返回结果。"})
+                default_msg = "任务执行完成，但未返回结果。"
+                result_msg.chain.append(Plain(default_msg))
+                new_contexts.append({"role": "assistant", "content": default_msg})
             
-            # 只有在需要时才发送消息
-            if need_send_result:
-                await self._send_task_result(unified_msg_origin, reminder, result_msg)
+            # 统一发送结果汇报
+            await self._send_task_result(unified_msg_origin, reminder, result_msg)
             
-            # 只有在启用上下文时才更新对话历史
-            if enable_context:
+            # 统一更新对话历史
+            if enable_context and curr_cid:
                 await self._update_conversation_history(original_msg_origin, curr_cid, new_contexts)
             
             logger.info(f"Task executed: {task_text}")
@@ -518,130 +518,85 @@ class TaskExecutor:
             original_msg_origin = self.message_handler.get_original_session_id(unified_msg_origin)
             await self.context.send_message(original_msg_origin, error_msg)
     
-    async def _handle_tool_calls(self, response, func_tool, task_text, unified_msg_origin, reminder, 
-                                new_contexts, result_msg, need_send_result):
-        """处理工具调用"""
+    async def _handle_tool_calls(self, response, func_tool, task_text, unified_msg_origin, reminder, new_contexts):
+        """
+        【重构】处理工具调用，并更新上下文。
+        此函数不再决定是否发送消息，只负责执行工具并返回原始结果。
+        """
         logger.info(f"检测到工具调用: {response.tools_call_name}")
         
-        # 收集工具调用结果
+        # 步骤1：将AI的工具调用意图添加到上下文中
+        # to_dict() 方法能将 response 对象转换为符合OpenAI格式的字典
+        if hasattr(response, 'to_dict'):
+            new_contexts.append(response.to_dict())
+        else: # 兼容旧版或不同类型的response对象
+            new_contexts.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": f"call_{i}", # 模拟一个ID
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)}
+                } for i, (name, args) in enumerate(zip(response.tools_call_name, response.tools_call_args))]
+            })
+
         tool_results = []
-        has_sent_messages = []  # 记录哪些函数已经自己发送了消息
-        complex_messages = []  # 记录函数返回的复杂消息
-        
         is_private_chat = self.message_handler.is_private_chat(unified_msg_origin)
         send_session_id = self._get_send_session_id(unified_msg_origin, is_private_chat)
         
         for i, func_name in enumerate(response.tools_call_name):
             func_args = response.tools_call_args[i] if i < len(response.tools_call_args) else {}
+            tool_call_id = response.tools_call_id[i] if hasattr(response, 'tools_call_id') and response.tools_call_id else f"call_{i}"
             
             logger.info(f"执行工具调用: {func_name}({func_args})")
             
+            func_result_str = ""
             try:
-                # 获取函数对象和处理器
                 func_obj = func_tool.get_func(func_name)
+                if not func_obj:
+                    raise ValueError(f"找不到函数处理器: {func_name}")
+
+                event = self._create_event_object(task_text, unified_msg_origin, reminder, is_private_chat, send_session_id)
                 
-                if func_obj:
-                    # 创建事件对象
-                    event = self._create_event_object(task_text, unified_msg_origin, reminder, is_private_chat, send_session_id)
-                    
-                    # 调用函数
-                    try:
-                        # 记录调用前的状态
-                        has_sent_message_before = event._has_send_oper
-                        
-                        # 调试信息：记录函数调用的详细参数
-                        logger.info(f"调用函数 {func_name}:")
-                        logger.info(f"  - func_args: {func_args}")
-                        logger.info(f"  - event.unified_msg_origin: {getattr(event, 'unified_msg_origin', 'NOT_SET')}")
-                        logger.info(f"  - event.session_id: {getattr(event, 'session_id', 'NOT_SET')}")
-                        logger.info(f"  - event.message_obj.group_id: {getattr(event.message_obj, 'group_id', 'NOT_SET')}")
-                        logger.info(f"  - event.message_obj.self_id: {getattr(event.message_obj, 'self_id', 'NOT_SET')}")
-                        
-                        # 调用函数
-                        if func_obj.handler:
-                            func_result = await func_obj.handler(event, **func_args)
-                        elif func_obj.mcp_client:
-                            if not func_obj.mcp_client.session:
-                                raise RuntimeError(f"MCP客户端未初始化，无法调用函数 {func_name}")
-                            func_result = await func_obj.mcp_client.session.call_tool(func_name, func_args)
-                        else:
-                            func_result = await func_obj.execute(**func_args)
-                        
-                        logger.info(f"函数调用结果类型: {type(func_result)}, 值: {func_result}")
-                        
-                        # 检查函数是否已经自己发送了消息
-                        if event._has_send_oper and not has_sent_message_before:
-                            logger.info(f"函数 {func_name} 已自行发送消息，不需要我们再发送")
-                            has_sent_messages.append(func_name)
-                        
-                        # 检查函数是否通过event.set_result()设置了复杂消息结果
-                        event_result = None
-                        if hasattr(event, 'get_result') and callable(event.get_result):
-                            event_result = event.get_result()
-                        elif hasattr(event, '_result'):
-                            event_result = event._result
-                        
-                        # 处理复杂消息结果
-                        if event_result and hasattr(event_result, 'chain') and event_result.chain:
-                            logger.info(f"函数 {func_name} 返回了复杂消息结果，包含 {len(event_result.chain)} 个组件")
-                            complex_messages.append({
-                                "name": func_name,
-                                "message_chain": event_result
-                            })
-                            has_sent_messages.append(func_name)  # 标记为已处理
-                        # 处理简单的字符串返回值
-                        elif func_result is not None and func_name not in has_sent_messages:
-                            # 检查返回值是否是MessageEventResult对象
-                            if hasattr(func_result, 'chain'):
-                                logger.info(f"函数 {func_name} 返回了MessageEventResult对象")
-                                complex_messages.append({
-                                    "name": func_name,
-                                    "message_chain": func_result
-                                })
-                                has_sent_messages.append(func_name)
-                            else:
-                                # 简单字符串结果
-                                tool_results.append({
-                                    "name": func_name,
-                                    "result": str(func_result)
-                                })
-                    except Exception as e:
-                        logger.error(f"执行函数时出错: {str(e)}")
-                        if func_name not in has_sent_messages:
-                            tool_results.append({
-                                "name": func_name,
-                                "result": f"错误: {str(e)}"
-                            })
+                # 调用函数
+                if func_obj.handler:
+                    func_result = await func_obj.handler(event, **func_args)
+                elif func_obj.mcp_client:
+                    if not func_obj.mcp_client.session:
+                        raise RuntimeError(f"MCP客户端未初始化，无法调用函数 {func_name}")
+                    func_result = await func_obj.mcp_client.session.call_tool(func_name, func_args)
                 else:
-                    logger.warning(f"找不到函数处理器: {func_name}")
+                    func_result = await func_obj.execute(**func_args)
+                
+                logger.info(f"函数调用结果类型: {type(func_result)}, 值: {func_result}")
+                
+                # 统一将结果转换为字符串
+                if func_result is None:
+                    func_result_str = "函数执行完成，无返回值。"
+                elif hasattr(func_result, 'chain'): # 如果是MessageEventResult
+                    func_result_str = func_result.get_plain_text() or "函数返回了复杂消息，但无文本内容。"
+                else:
+                    func_result_str = str(func_result)
+
             except Exception as e:
-                logger.error(f"准备执行函数调用时出错: {str(e)}")
-                import traceback
-                logger.error(traceback.format_exc())
-        
-        # 处理复杂消息（图片、文件等）
-        if complex_messages:
-            await self._handle_complex_messages(complex_messages, unified_msg_origin, reminder)
-        
-        # 函数处理逻辑结束后判断是否需要发送结果
-        # 如果所有函数都已经自己发送了消息，我们就不需要再发送了
-        if len(has_sent_messages) == len(response.tools_call_name):
-            logger.info("所有函数都已自行发送消息，不需要额外发送结果")
-            return False  # 返回不需要发送结果
-        # 如果只有部分函数自己发送了消息，我们只润色没有自己发送消息的函数的结果
-        elif tool_results:
-            await self._process_tool_results(tool_results, task_text, unified_msg_origin, new_contexts, result_msg)
-            return True  # 返回需要发送结果
-        else:
-            # 没有工具调用结果
-            if has_sent_messages:
-                # 如果有函数自己发送了消息，我们不需要再发送额外的消息
-                return False  # 返回不需要发送结果
-            else:
-                result_msg.chain.append(Plain("任务执行完成，但未能获取有效结果。"))
-                # 添加结果到历史记录
-                new_contexts.append({"role": "assistant", "content": "任务执行完成，但未能获取有效结果。"})
-                return True  # 返回需要发送结果
+                logger.error(f"执行函数 {func_name} 时出错: {str(e)}")
+                func_result_str = f"错误: {str(e)}"
+
+            # 步骤2：将每个工具的执行结果添加到上下文中
+            new_contexts.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": func_name,
+                "content": func_result_str
+            })
+            
+            # 收集原始结果用于后续处理
+            tool_results.append({
+                "name": func_name,
+                "result": func_result_str
+            })
+            
+        return tool_results
     
     async def _handle_complex_messages(self, complex_messages: list, unified_msg_origin: str, reminder: dict):
         """处理复杂消息类型（图片、文件、视频等）"""
@@ -837,19 +792,24 @@ class TaskExecutor:
             msg_type = "FriendMessage" if is_private_chat else "GroupMessage"
             return f"{platform_name}:{msg_type}:{send_session_id}"
     
-    async def _process_tool_results(self, tool_results, task_text, unified_msg_origin, new_contexts, result_msg):
-        """处理工具调用结果"""
-        # 如果有函数调用结果，让LLM润色结果
+    async def _process_tool_results(self, tool_results, task_text, unified_msg_origin) -> str:
+        """
+        【重构】处理工具调用结果，仅负责调用LLM润色并返回最终回复的字符串。
+        """
+        # 如果没有工具结果，返回一个默认消息
+        if not tool_results:
+            return "任务已执行。"
+
         # 构建提示词，让LLM基于工具调用结果生成自然语言响应
         tool_results_text = ""
         for tr in tool_results:
-            tool_results_text += f"- {tr['name']}: {tr['result']}\n"
+            tool_results_text += f"- 工具 `{tr['name']}` 的执行结果:\n```\n{tr['result']}\n```\n"
         
-        summary_prompt = f"""我执行了用户的任务"{task_text}"，并获得了以下结果：
+        summary_prompt = f"""我执行了用户的任务"{task_text}"，并通过工具调用获得了以下结果：
         
 {tool_results_text}
 
-请对这些结果进行整理和润色，用自然、友好的语言向用户展示这些信息。直接回复用户的问题，不要提及这是定时任务或使用了什么函数。"""
+请对这些结果进行整理和润色，用自然、友好的语言向用户汇报任务的执行情况。直接回复用户，不要提及这是一个定时任务或你调用了什么工具。"""
         
         # 获取提供商
         provider = self.context.get_using_provider()
@@ -858,21 +818,17 @@ class TaskExecutor:
         summary_response = await provider.text_chat(
             prompt=summary_prompt,
             session_id=unified_msg_origin,
-            contexts=[]  # 不使用上下文，避免混淆
+            contexts=[]  # 在这里不使用历史上下文，避免LLM被混淆，只专注于润色当前结果
         )
         
         if summary_response and summary_response.completion_text:
-            result_msg.chain.append(Plain(summary_response.completion_text))
-            # 添加AI的回复到历史记录
-            new_contexts.append({"role": "assistant", "content": summary_response.completion_text})
+            return summary_response.completion_text
         else:
-            # 如果润色失败，直接显示原始结果
-            result_text = "执行结果:\n"
+            # 如果润色失败，返回一个格式化的原始结果
+            result_text = "任务执行结果如下:\n"
             for tr in tool_results:
                 result_text += f"[{tr['name']}]: {tr['result']}\n"
-            result_msg.chain.append(Plain(result_text))
-            # 添加结果到历史记录
-            new_contexts.append({"role": "assistant", "content": result_text})
+            return result_text.strip()
     
     async def _send_task_result(self, unified_msg_origin: str, reminder: dict, result_msg: MessageChain):
         """发送任务结果"""
@@ -900,6 +856,11 @@ class TaskExecutor:
         for item in result_msg.chain:
             final_msg.chain.append(item)
         
+        # 确保消息不为空
+        if not final_msg.chain:
+            logger.warning("试图发送一条空消息，已中止。")
+            return
+
         send_result = await self.context.send_message(original_msg_origin, final_msg)
         logger.info(f"消息发送结果: {send_result}")
     
