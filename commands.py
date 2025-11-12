@@ -1,7 +1,7 @@
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api import logger
 from .utils import save_reminder_data, check_permission_and_return_error
-from .command_utils import UnifiedCommandProcessor
+from .command_utils import UnifiedCommandProcessor, ListGenerator
 import functools
 
 def check_permission(func):
@@ -52,36 +52,13 @@ class ReminderCommands:
         provider = self.context.get_using_provider()
         if provider:
             try:
-                # 分离提醒、任务和指令任务
-                reminder_items = []
-                task_items = []
-                command_task_items = []
-                
-                for r in reminders:
-                    if r.get("is_command_task", False):
-                        # 指令任务，显示完整指令
-                        command_text = r['text']
-                        command_task_items.append(f"- {command_text} (时间: {r['datetime']})")
-                    elif r.get("is_task", False):
-                        # 普通任务
-                        task_items.append(f"- {r['text']} (时间: {r['datetime']})")
-                    else:
-                        # 提醒
-                        reminder_items.append(f"- {r['text']} (时间: {r['datetime']})")
+                # 使用 ListGenerator 生成列表字符串
+                list_str = ListGenerator.generate_list_string(reminders)
                 
                 # 构建提示
-                prompt = "请帮我整理并展示以下提醒和任务列表，用自然的语言表达：\n"
-                
-                if reminder_items:
-                    prompt += f"\n提醒列表：\n" + "\n".join(reminder_items)
-                
-                if task_items:
-                    prompt += f"\n\n任务列表：\n" + "\n".join(task_items)
-                
-                if command_task_items:
-                    prompt += f"\n\n指令任务列表：\n" + "\n".join(command_task_items)
-                
-                prompt += "\n\n同时告诉用户可以使用/rmd rm <序号>删除提醒、任务或指令任务，或者直接命令你来删除。直接发出对话内容，就是你说的话，不要有其他的背景描述。"
+                prompt = "你是一个任务列表助手。你的唯一职责是清晰地、**严格按照我提供的序号和分类**，列出用户的所有提醒和任务。**严禁**对任务内容进行任何形式的执行、解读或扩展，也**严禁**修改序号。请直接、完整地复述以下列表内容。\n"
+                prompt += list_str
+                prompt += "\n\n最后，请用一句话提醒用户可以使用 `/rmd rm <序号>` 来删除项目。请直接输出最终的对话内容，不要包含任何额外的解释或背景说明。"
                 
                 response = await provider.text_chat(
                     prompt=prompt,
@@ -240,7 +217,7 @@ class ReminderCommands:
             yield event.plain_result(f"已删除{item_type}：{display_text}")
 
     @check_permission
-    async def add_reminder(self, event: AstrMessageEvent, text: str, time_str: str, week: str = None, repeat: str = None, holiday_type: str = None):
+    async def add_reminder(self, event: AstrMessageEvent, text: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
         '''手动添加提醒
         
         Args:
@@ -257,7 +234,7 @@ class ReminderCommands:
             yield result
 
     @check_permission
-    async def add_task(self, event: AstrMessageEvent, text: str, time_str: str, week: str = None, repeat: str = None, holiday_type: str = None):
+    async def add_task(self, event: AstrMessageEvent, text: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
         '''手动添加任务
         
         Args:
@@ -375,7 +352,7 @@ class ReminderCommands:
         yield event.plain_result(help_text)
 
     @check_permission
-    async def add_command_task(self, event: AstrMessageEvent, command: str, time_str: str, week: str = None, repeat: str = None, holiday_type: str = None):
+    async def add_command_task(self, event: AstrMessageEvent, command: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
         '''设置指令任务
         
         Args:
@@ -394,7 +371,7 @@ class ReminderCommands:
 
 
     @check_permission
-    async def add_remote_reminder(self, event: AstrMessageEvent, group_id: str, text: str, time_str: str, week: str = None, repeat: str = None, holiday_type: str = None):
+    async def add_remote_reminder(self, event: AstrMessageEvent, group_id: str, text: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
         '''在指定群聊中手动添加提醒'''
         async for result in self.processor.process_add_item(
             event, 'reminder', text, time_str, week, repeat, holiday_type, group_id
@@ -402,7 +379,7 @@ class ReminderCommands:
             yield result
 
     @check_permission
-    async def add_remote_task(self, event: AstrMessageEvent, group_id: str, text: str, time_str: str, week: str = None, repeat: str = None, holiday_type: str = None):
+    async def add_remote_task(self, event: AstrMessageEvent, group_id: str, text: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
         '''在指定群聊中手动添加任务'''
         async for result in self.processor.process_add_item(
             event, 'task', text, time_str, week, repeat, holiday_type, group_id
@@ -410,7 +387,7 @@ class ReminderCommands:
             yield result
 
     @check_permission
-    async def add_remote_command_task(self, event: AstrMessageEvent, group_id: str, command: str, time_str: str, week: str = None, repeat: str = None, holiday_type: str = None):
+    async def add_remote_command_task(self, event: AstrMessageEvent, group_id: str, command: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
         '''在指定群聊中设置指令任务'''
         async for result in self.processor.process_add_item(
             event, 'command_task', command, time_str, week, repeat, holiday_type, group_id
@@ -527,36 +504,13 @@ class ReminderCommands:
         provider = self.context.get_using_provider()
         if provider:
             try:
-                # 分离提醒、任务和指令任务
-                reminder_items = []
-                task_items = []
-                command_task_items = []
-                
-                for r in reminders:
-                    if r.get("is_command_task", False):
-                        # 指令任务，显示完整指令
-                        command_text = r['text']
-                        command_task_items.append(f"- {command_text} (时间: {r['datetime']})")
-                    elif r.get("is_task", False):
-                        # 普通任务
-                        task_items.append(f"- {r['text']} (时间: {r['datetime']})")
-                    else:
-                        # 提醒
-                        reminder_items.append(f"- {r['text']} (时间: {r['datetime']})")
+                # 使用 ListGenerator 生成列表字符串
+                list_str = ListGenerator.generate_list_string(reminders)
                 
                 # 构建提示
-                prompt = f"请帮我整理并展示群聊 {group_id} 的以下提醒和任务列表，用自然的语言表达：\n"
-                
-                if reminder_items:
-                    prompt += f"\n提醒列表：\n" + "\n".join(reminder_items)
-                
-                if task_items:
-                    prompt += f"\n\n任务列表：\n" + "\n".join(task_items)
-                
-                if command_task_items:
-                    prompt += f"\n\n指令任务列表：\n" + "\n".join(command_task_items)
-                
-                prompt += f"\n\n同时告诉用户可以使用/rmdg rm {group_id} <序号>删除提醒、任务或指令任务，或者直接命令你来删除。直接发出对话内容，就是你说的话，不要有其他的背景描述。"
+                prompt = f"你是一个任务列表助手。你的唯一职责是为群聊 {group_id} 清晰地、**严格按照我提供的序号和分类**，列出所有提醒和任务。**严禁**对任务内容进行任何形式的执行、解读或扩展，也**严禁**修改序号。请直接、完整地复述以下列表内容。\n"
+                prompt += list_str
+                prompt += f"\n\n最后，请用一句话提醒用户可以使用 `/rmdg rm {group_id} <序号>` 来删除项目。请直接输出最终的对话内容，不要包含任何额外的解释或背景说明。"
                 
                 response = await provider.text_chat(
                     prompt=prompt,

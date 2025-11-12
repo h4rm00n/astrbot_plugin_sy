@@ -450,11 +450,12 @@ class SessionHelper:
         return creator_id, creator_name
     
     @staticmethod
-    async def find_user_id_by_name(event: AstrMessageEvent, user_name: str) -> Optional[str]:
+    async def find_user_id_by_name(bot, event: AstrMessageEvent, user_name: str) -> Optional[str]:
         """
         根据用户名查找用户ID（仅在群聊中有效）
         
         Args:
+            bot: bot实例
             event: 消息事件
             user_name: 要查找的用户名
             
@@ -468,7 +469,7 @@ class SessionHelper:
         try:
             group_id = int(event.get_group_id())
             # 获取群成员列表
-            members = await event.bot.get_group_member_list(group_id=group_id)
+            members = await bot.get_group_member_list(group_id=group_id)
             
             # 遍历成员列表，查找匹配的用户名
             for member in members:
@@ -668,7 +669,7 @@ class UnifiedCommandProcessor:
             target_user_id = None
             if item_type in ['reminder', 'task'] and user_name and event.get_group_id():
                 try:
-                    target_user_id = await SessionHelper.find_user_id_by_name(event, user_name)
+                    target_user_id = await SessionHelper.find_user_id_by_name(self.star.context.bot, event, user_name)
                 except Exception as e:
                     # 查找失败时保持原有逻辑，使用设置者的ID
                     pass
@@ -758,3 +759,74 @@ class UnifiedCommandProcessor:
         except Exception as e:
             item_type_name = {'reminder': '提醒', 'task': '任务', 'command_task': '指令任务'}.get(item_type, '项目')
             yield event.plain_result(f"设置{item_type_name}时出错：{str(e)}")
+
+class ListGenerator:
+    """列表生成器"""
+
+    @staticmethod
+    def generate_list_string(reminders: List[Dict[str, Any]]) -> str:
+        """
+        生成带连续序号的提醒和任务列表字符串，包含重复情况
+
+        Args:
+            reminders: 提醒和任务列表
+
+        Returns:
+            str: 格式化后的列表字符串
+        """
+        if not reminders:
+            return "当前没有设置任何提醒或任务。"
+
+        all_items_str = []
+        reminders_list = [r for r in reminders if not r.get("is_task", False)]
+        tasks_list = [r for r in reminders if r.get("is_task", False) and not r.get("is_command_task", False)]
+        command_tasks_list = [r for r in reminders if r.get("is_command_task", False)]
+
+        current_index = 1
+        if reminders_list:
+            all_items_str.append("\n提醒列表：")
+            for r in reminders_list:
+                repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
+                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]")
+                current_index += 1
+
+        if tasks_list:
+            all_items_str.append("\n任务列表：")
+            for r in tasks_list:
+                repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
+                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]")
+                current_index += 1
+
+        if command_tasks_list:
+            all_items_str.append("\n指令任务列表：")
+            for r in command_tasks_list:
+                command_text = r['text']
+                repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
+                all_items_str.append(f"{current_index}. {command_text} (时间: {r['datetime']}) [{repeat_info}]")
+                current_index += 1
+        
+        return "\n".join(all_items_str)
+    
+    @staticmethod
+    def _get_repeat_description(repeat_str: str) -> str:
+        """
+        获取重复类型的描述
+        
+        Args:
+            repeat_str: 重复类型字符串
+            
+        Returns:
+            str: 重复类型描述
+        """
+        if not repeat_str or repeat_str == "none":
+            return "一次性"
+        
+        # 处理带节假日类型的重复
+        if "_" in repeat_str:
+            parts = repeat_str.split("_")
+            if len(parts) == 2:
+                repeat_type, holiday_type = parts
+                return RepeatDescriptionGenerator.generate_repeat_description(repeat_type, holiday_type)
+        
+        # 处理普通重复类型
+        return RepeatDescriptionGenerator.generate_repeat_description(repeat_str)
