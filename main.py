@@ -4,6 +4,7 @@ from astrbot.api.message_components import *
 from astrbot.api.event.filter import command, command_group
 from astrbot.api import logger, AstrBotConfig
 import os
+import re
 from pathlib import Path
 from .utils import load_reminder_data, CompatibilityHandler
 from .scheduler import ReminderScheduler
@@ -132,8 +133,13 @@ class SmartReminder(Star):
             user_name(string): 提醒对象名称，默认为"用户"
             repeat(string): 重复类型，可选值：daily(每天)，weekly(每周)，monthly(每月)，yearly(每年)，none(不重复)。
             holiday_type(string): 可选，节假日类型：workday(仅工作日执行)，holiday(仅法定节假日执行)
-            group_id(string): 可选，指定群聊ID，用于在特定群聊中设置提醒或任务
+            group_id(string): 可选，指定群聊ID，用于在特定群聊中设置提醒或任务，默认值为None（注意，当且仅当用户明确告诉你群聊id比如qq群号，才需要填写，如果只是本群提醒或任务，不需要填写）
         '''
+        # 校验 group_id，防止 AI 填入中文
+        if group_id and re.search(r'[\u4e00-\u9fa5]', group_id):
+            logger.warning(f"Detected Chinese characters in group_id: {group_id}. Ignoring group_id.")
+            group_id = None
+
         is_task_bool = is_task and is_task.lower() == "yes"
         if is_task_bool:
             return await self.tools.set_task(event, text, datetime_str, repeat, holiday_type, group_id)
@@ -165,6 +171,11 @@ class SmartReminder(Star):
             reminder_only(string): 可选，是否只删除提醒，可选值：yes/no，默认no
             group_id(string): 可选，指定群聊ID，用于删除特定群聊中的提醒或任务
         '''
+        # 校验 group_id，防止 AI 填入中文
+        if group_id and re.search(r'[\u4e00-\u9fa5]', group_id):
+            logger.warning(f"Detected Chinese characters in group_id: {group_id}. Ignoring group_id.")
+            group_id = None
+
         is_task_only = task_only and task_only.lower() == "yes"
         is_reminder_only = reminder_only and reminder_only.lower() == "yes"
         return await self.tools.delete_reminder(event, content, time, weekday, repeat_type, date, all, 
