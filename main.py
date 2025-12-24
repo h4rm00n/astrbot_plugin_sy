@@ -12,7 +12,7 @@ from .tools import ReminderTools
 from .commands import ReminderCommands
 from .qq_id_cache import init_qq_id_cache
 
-@register("ai_reminder", "kjqwdw", "智能定时任务，输入/rmd help查看帮助", "1.4.0")
+@register("ai_reminder", "kjqwdw", "智能定时任务，输入/rmd help查看帮助", "1.4.2")
 class SmartReminder(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -38,6 +38,9 @@ class SmartReminder(Star):
         
         # 白名单配置
         self.whitelist = self.config.get("whitelist", "")
+        
+        # 不活跃自动清理配置（小时）
+        self.inactive_timeout_hours = self.config.get("inactive_timeout_hours", 0)
         
         # 数据文件路径处理 - 符合框架规范并保持向后兼容
         # 首先检查旧位置是否有数据，如果有则迁移到新位置
@@ -121,6 +124,7 @@ class SmartReminder(Star):
         logger.info(f"每用户最大提醒数：{self.max_reminders_per_user if self.max_reminders_per_user > 0 else '不限制'}")
         logger.info(f"指令任务最大等待时间：{self.max_command_wait_time}秒")
         logger.info(f"用户白名单：{'已启用' if self.whitelist.strip() else '未启用'}")
+        logger.info(f"不活跃自动清理：{str(self.inactive_timeout_hours) + '小时' if self.inactive_timeout_hours > 0 else '禁用'}")
 
     @filter.llm_tool(name="set_reminder_or_task")
     async def set_reminder_or_task(self, event, text: str, datetime_str: str, is_task: str = "no", user_name: str = "用户", repeat: str | None = None, holiday_type: str | None = None, group_id: str | None = None):
@@ -248,6 +252,27 @@ class SmartReminder(Star):
         async for result in self.commands.show_help(event):
             yield result
 
+    @rmd.command("expire")
+    async def set_expire(self, event: AstrMessageEvent, index: int, time_str: str):
+        '''设置提醒或任务的过期时间，到期后自动删除
+        
+        Args:
+            index(int): 提醒或任务的序号
+            time_str(string): 过期时间，格式为 HH:MM 或 HHMM 或 YYYY-MM-DD-HH:MM
+        '''
+        async for result in self.commands.set_expire(event, index, time_str):
+            yield result
+
+    @rmd.command("unexpire")
+    async def remove_expire(self, event: AstrMessageEvent, index: int):
+        '''取消提醒或任务的过期时间设置
+        
+        Args:
+            index(int): 提醒或任务的序号
+        '''
+        async for result in self.commands.remove_expire(event, index):
+            yield result
+
     @rmd.command("command")
     async def add_command_task(self, event: AstrMessageEvent, command: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
         '''设置指令任务
@@ -357,4 +382,54 @@ class SmartReminder(Star):
         
         # 创建异步任务
         asyncio.create_task(delayed_init())
+
+    @filter.on_decorating_result()
+    async def track_interaction(self, event: AstrMessageEvent):
+        '''追踪用户最后互动时间（用于不活跃自动清理功能）'''
+        # 如果没有启用不活跃清理，直接返回
+        if self.inactive_timeout_hours <= 0:
+            return
+        
+        try:
+            import datetime
+            from .utils import save_reminder_data
+            
+            creator_id = event.get_sender_id()
+            raw_msg_origin = event.unified_msg_origin
+            
+            # 获取会话ID
+            if self.unique_session:
+                msg_origin = self.tools.get_session_id(raw_msg_origin, creator_id)
+            else:
+                msg_origin = raw_msg_origin
+            
+            # 检查该会话是否有提醒数据
+            actual_key = self.compatibility_handler.get_actual_key(msg_origin)
+            if actual_key not in self.reminder_data:
+                return
+            
+            reminders = self.reminder_data.get(actual_key, [])
+            if not reminders:
+                return
+            
+            # 更新该会话中所有提醒的最后互动时间
+            current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            updated = False
+            for reminder in reminders:
+                # 只更新属于当前用户的提醒（会话隔离模式下）
+                if self.unique_session:
+                    if reminder.get("creator_id") == creator_id:
+                        reminder["last_interaction"] = current_time
+                        updated = True
+                else:
+                    # 非会话隔离模式，更新所有提醒
+                    reminder["last_interaction"] = current_time
+                    updated = True
+            
+            if updated:
+                await save_reminder_data(str(self.data_file), self.reminder_data)
+                
+        except Exception as e:
+            # 静默处理错误，不影响正常消息处理
+            logger.debug(f"更新互动时间失败: {e}")
 

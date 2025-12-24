@@ -91,5 +91,12 @@
         "hint": "指令任务执行时等待响应的最大时间（秒）。如果指令执行时间较长，可以适当增加此值。建议设置为10-60之间。",
         "obvious_hint": true,
         "default": 20
+    },
+    "inactive_timeout_hours": {
+        "description": "不活跃自动清理（小时）",
+        "type": "int",
+        "hint": "用户超过指定小时数没有与Bot互动，则自动删除该用户的所有提醒和任务。设置为0表示不限制。例如设置168表示7天不互动就清理。",
+        "obvious_hint": true,
+        "default": 0
     }
 }

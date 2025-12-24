@@ -787,14 +787,16 @@ class ListGenerator:
             all_items_str.append("\n提醒列表：")
             for r in reminders_list:
                 repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
-                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]")
+                expire_info = ListGenerator._get_expire_description(r.get("expire_datetime"))
+                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]{expire_info}")
                 current_index += 1
 
         if tasks_list:
             all_items_str.append("\n任务列表：")
             for r in tasks_list:
                 repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
-                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]")
+                expire_info = ListGenerator._get_expire_description(r.get("expire_datetime"))
+                all_items_str.append(f"{current_index}. {r['text']} (时间: {r['datetime']}) [{repeat_info}]{expire_info}")
                 current_index += 1
 
         if command_tasks_list:
@@ -802,7 +804,8 @@ class ListGenerator:
             for r in command_tasks_list:
                 command_text = r['text']
                 repeat_info = ListGenerator._get_repeat_description(r.get("repeat", "none"))
-                all_items_str.append(f"{current_index}. {command_text} (时间: {r['datetime']}) [{repeat_info}]")
+                expire_info = ListGenerator._get_expire_description(r.get("expire_datetime"))
+                all_items_str.append(f"{current_index}. {command_text} (时间: {r['datetime']}) [{repeat_info}]{expire_info}")
                 current_index += 1
         
         return "\n".join(all_items_str)
@@ -830,3 +833,19 @@ class ListGenerator:
         
         # 处理普通重复类型
         return RepeatDescriptionGenerator.generate_repeat_description(repeat_str)
+    
+    @staticmethod
+    def _get_expire_description(expire_datetime: Optional[str]) -> str:
+        """
+        获取过期时间的描述
+        
+        Args:
+            expire_datetime: 过期时间字符串
+            
+        Returns:
+            str: 过期时间描述
+        """
+        if not expire_datetime:
+            return ""
+        
+        return f" ⏰过期: {expire_datetime}"

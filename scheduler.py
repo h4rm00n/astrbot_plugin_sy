@@ -64,6 +64,9 @@ class ReminderScheduler:
         # 初始化任务
         self._init_scheduler()
         
+        # 初始化不活跃清理任务
+        self._init_inactive_cleanup_job()
+        
         # 确保调度器运行
         if not self.scheduler.running:
             self.scheduler.start()
@@ -293,6 +296,32 @@ class ReminderScheduler:
                 # 这样确保数据文件中保存的job_id始终是当前调度器中实际的ID
                 reminder["job_id"] = job_id
                 self.reminder_data[group][i] = reminder
+                
+                # 如果有过期时间设置，也添加过期删除任务
+                if reminder.get("expire_datetime"):
+                    try:
+                        expire_dt = datetime.datetime.strptime(reminder["expire_datetime"], "%Y-%m-%d %H:%M")
+                        if expire_dt > datetime.datetime.now():
+                            expire_job_id = self.add_expire_job(group, reminder, expire_dt, i)
+                            if expire_job_id:
+                                reminder["expire_job_id"] = expire_job_id
+                                logger.info(f"恢复过期删除任务: {reminder['text']} 过期时间: {expire_dt.strftime('%Y-%m-%d %H:%M')}")
+                        else:
+                            # 过期时间已过，直接删除该提醒
+                            logger.info(f"检测到已过期的提醒: {reminder['text']}，将被删除")
+                            # 标记需要删除（不在循环中直接删除，避免修改列表问题）
+                            reminder["_to_delete"] = True
+                    except ValueError as e:
+                        logger.error(f"解析过期时间失败: {reminder.get('expire_datetime')}: {str(e)}")
+        
+        # 清理已标记需要删除的过期提醒
+        for group in list(self.reminder_data.keys()):
+            self.reminder_data[group] = [
+                r for r in self.reminder_data[group] if not r.get("_to_delete", False)
+            ]
+            # 如果群组没有任何提醒了，删除这个群组的条目
+            if not self.reminder_data[group]:
+                del self.reminder_data[group]
         
         # 保存更新后的数据到文件（包含新的job_id）
         try:
@@ -571,6 +600,87 @@ class ReminderScheduler:
             logger.error(f"Job not found: {job_id}")
             return False
     
+    def add_expire_job(self, msg_origin, reminder, expire_dt, reminder_index):
+        '''添加过期删除任务
+        
+        Args:
+            msg_origin: 会话ID
+            reminder: 提醒数据
+            expire_dt: 过期时间
+            reminder_index: 提醒在列表中的索引
+            
+        Returns:
+            str: 任务ID，失败时返回None
+        '''
+        try:
+            # 生成唯一的过期任务ID
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:-3]
+            expire_job_id = f"expire_{msg_origin}_{reminder_index}_{timestamp}"
+            
+            # 确保任务ID唯一性
+            while any(job.id == expire_job_id for job in self.scheduler.get_jobs()):
+                import random
+                expire_job_id = f"expire_{msg_origin}_{reminder_index}_{timestamp}_{random.randint(1000, 9999)}"
+            
+            # 添加过期删除任务
+            self.scheduler.add_job(
+                self._expire_callback,
+                'date',
+                args=[msg_origin, reminder],
+                run_date=expire_dt,
+                misfire_grace_time=60,
+                id=expire_job_id
+            )
+            
+            logger.info(f"添加过期删除任务: {expire_job_id}, 过期时间: {expire_dt.strftime('%Y-%m-%d %H:%M')}")
+            return expire_job_id
+            
+        except Exception as e:
+            logger.error(f"添加过期删除任务失败: {str(e)}")
+            return None
+    
+    async def _expire_callback(self, unified_msg_origin: str, reminder: dict):
+        '''过期删除回调函数'''
+        try:
+            logger.info(f"执行过期删除: {reminder.get('text', 'unknown')}")
+            
+            # 使用兼容性查找来找到正确的数据key
+            compatible_key = find_compatible_reminder_key(self.reminder_data, unified_msg_origin)
+            if not compatible_key:
+                logger.warning(f"过期删除: 未找到兼容的key: {unified_msg_origin}")
+                return
+            
+            # 查找并删除这个提醒
+            reminders = self.reminder_data.get(compatible_key, [])
+            for i, r in enumerate(reminders):
+                if (r.get('text') == reminder.get('text') and 
+                    r.get('datetime') == reminder.get('datetime') and
+                    r.get('creator_id') == reminder.get('creator_id')):
+                    
+                    # 如果有保存的主任务ID，删除调度任务
+                    if r.get('job_id'):
+                        try:
+                            self.scheduler.remove_job(r['job_id'])
+                            logger.info(f"过期删除: 移除主任务 {r['job_id']}")
+                        except Exception as e:
+                            logger.warning(f"过期删除: 移除主任务失败 {r['job_id']}: {str(e)}")
+                    
+                    # 从列表中删除
+                    self.reminder_data[compatible_key].pop(i)
+                    
+                    is_task = reminder.get("is_task", False)
+                    is_command_task = reminder.get("is_command_task", False)
+                    item_type = "指令任务" if is_command_task else ("任务" if is_task else "提醒")
+                    
+                    logger.info(f"过期删除: {item_type}「{reminder['text']}」已自动删除")
+                    await save_reminder_data(self.data_file, self.reminder_data)
+                    break
+            else:
+                logger.warning(f"过期删除: 未找到匹配的提醒: {reminder.get('text', 'unknown')}")
+                
+        except Exception as e:
+            logger.error(f"过期删除回调执行失败: {str(e)}")
+    
     # 获取会话ID
     def get_session_id(self, unified_msg_origin, reminder):
         """
@@ -616,4 +726,104 @@ class ReminderScheduler:
     @staticmethod
     def get_scheduler():
         """获取当前的全局调度器实例"""
-        return sys._GLOBAL_SCHEDULER_REGISTRY.get('scheduler') 
+        return sys._GLOBAL_SCHEDULER_REGISTRY.get('scheduler')
+    
+    def _init_inactive_cleanup_job(self):
+        '''初始化不活跃清理定时任务'''
+        inactive_timeout_hours = self.config.get("inactive_timeout_hours", 0)
+        
+        if inactive_timeout_hours <= 0:
+            logger.info("不活跃自动清理功能已禁用")
+            return
+        
+        # 移除已有的不活跃清理任务
+        try:
+            self.scheduler.remove_job("inactive_cleanup_job")
+        except JobLookupError:
+            pass
+        
+        # 每小时检查一次不活跃用户
+        self.scheduler.add_job(
+            self._inactive_cleanup_callback,
+            'interval',
+            hours=1,
+            id="inactive_cleanup_job",
+            misfire_grace_time=300
+        )
+        logger.info(f"已添加不活跃清理任务，每小时检查一次，超时时间: {inactive_timeout_hours}小时")
+    
+    async def _inactive_cleanup_callback(self):
+        '''不活跃清理回调函数'''
+        try:
+            inactive_timeout_hours = self.config.get("inactive_timeout_hours", 0)
+            if inactive_timeout_hours <= 0:
+                return
+            
+            logger.info("开始检查不活跃用户提醒...")
+            
+            current_time = datetime.datetime.now()
+            timeout_delta = datetime.timedelta(hours=inactive_timeout_hours)
+            
+            cleaned_count = 0
+            
+            # 遍历所有会话
+            for session_key in list(self.reminder_data.keys()):
+                reminders = self.reminder_data.get(session_key, [])
+                
+                # 记录需要删除的索引
+                to_delete = []
+                
+                for i, reminder in enumerate(reminders):
+                    last_interaction_str = reminder.get("last_interaction")
+                    
+                    if not last_interaction_str:
+                        # 没有互动记录，跳过（可能是旧数据，不清理）
+                        continue
+                    
+                    try:
+                        last_interaction = datetime.datetime.strptime(last_interaction_str, "%Y-%m-%d %H:%M")
+                        
+                        # 检查是否超时
+                        if current_time - last_interaction > timeout_delta:
+                            to_delete.append(i)
+                            logger.info(f"检测到不活跃提醒: {reminder.get('text', 'unknown')}，最后互动: {last_interaction_str}")
+                    except ValueError:
+                        continue
+                
+                # 从后往前删除
+                for i in sorted(to_delete, reverse=True):
+                    reminder = reminders[i]
+                    
+                    # 删除主任务
+                    if reminder.get('job_id'):
+                        try:
+                            self.scheduler.remove_job(reminder['job_id'])
+                        except:
+                            pass
+                    
+                    # 删除过期任务
+                    if reminder.get('expire_job_id'):
+                        try:
+                            self.scheduler.remove_job(reminder['expire_job_id'])
+                        except:
+                            pass
+                    
+                    reminders.pop(i)
+                    cleaned_count += 1
+                
+                # 更新数据
+                if to_delete:
+                    self.reminder_data[session_key] = reminders
+                    
+                    # 如果会话没有提醒了，删除会话
+                    if not reminders:
+                        del self.reminder_data[session_key]
+            
+            if cleaned_count > 0:
+                await save_reminder_data(self.data_file, self.reminder_data)
+                logger.info(f"不活跃清理完成，共清理 {cleaned_count} 个提醒/任务")
+            else:
+                logger.debug("不活跃清理检查完成，无需清理")
+                
+        except Exception as e:
+            logger.error(f"不活跃清理失败: {str(e)}") 

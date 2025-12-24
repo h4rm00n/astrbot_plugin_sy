@@ -238,7 +238,16 @@ class ReminderCommands:
 4. 删除提醒或任务：
    /rmd rm <序号> - 删除指定提醒或任务，注意任务序号是提醒序号继承，比如提醒有两个，任务1的序号就是3（llm会自动重编号）
 
-5. 星期可选值：
+5. 设置过期自动删除：
+   /rmd expire <序号> <时间> - 为提醒或任务设置过期时间，到期后自动删除
+   /rmd unexpire <序号> - 取消过期时间设置
+   
+   时间格式同上（HH:MM、HHMM、YYYY-MM-DD-HH:MM等）
+   例如：
+   - /rmd expire 1 2025-01-01-00:00 (在2025年1月1日0点自动删除)
+   - /rmd expire 2 18:00 (在今天/明天18:00自动删除)
+
+6. 星期可选值：
    - mon: 周一
    - tue: 周二
    - wed: 周三
@@ -247,20 +256,20 @@ class ReminderCommands:
    - sat: 周六
    - sun: 周日
 
-6. 重复类型：
+7. 重复类型：
    - daily: 每天重复
    - weekly: 每周重复
    - monthly: 每月重复
    - yearly: 每年重复
 
-7. 节假日类型：
+8. 节假日类型：
    - workday: 仅工作日触发（法定节假日不触发）
    - holiday: 仅法定节假日触发
 
-8. AI智能提醒与任务
+9. AI智能提醒与任务
    正常对话即可，AI会自己设置提醒或任务，但需要AI支持LLM
 
-9. 会话隔离功能
+10. 会话隔离功能
    {session_isolation_status}
    - 关闭状态：群聊中所有成员共享同一组提醒和任务
    - 开启状态：群聊中每个成员都有自己独立的提醒和任务
@@ -269,7 +278,7 @@ class ReminderCommands:
 
 注：时间格式为 HH:MM 或 HHMM，如 8:05 或 0805
 
-10. 数量限制
+11. 数量限制
    每个用户最多可创建 {max_reminders} 个提醒和任务
    {limit_scope_description}
 
@@ -304,7 +313,135 @@ class ReminderCommands:
         ):
             yield result
 
+    @check_permission
+    async def set_expire(self, event: AstrMessageEvent, index: int, time_str: str):
+        '''设置提醒或任务的过期时间，到期后自动删除
+        
+        Args:
+            index(int): 提醒或任务的序号
+            time_str(string): 过期时间，格式为 HH:MM 或 HHMM 或 YYYY-MM-DD-HH:MM
+        '''
+        import datetime
+        from .utils import parse_datetime
+        
+        # 获取用户ID，用于会话隔离
+        creator_id = event.get_sender_id()
+        
+        # 获取会话ID
+        raw_msg_origin = event.unified_msg_origin
+        if self.unique_session:
+            msg_origin = self.tools.get_session_id(raw_msg_origin, creator_id)
+        else:
+            msg_origin = raw_msg_origin
+            
+        # 使用兼容性处理器获取提醒列表
+        reminders = self.star.compatibility_handler.get_reminders(msg_origin)
+        if not reminders:
+            yield event.plain_result("没有设置任何提醒或任务。")
+            return
+            
+        if index < 1 or index > len(reminders):
+            yield event.plain_result("序号无效。")
+            return
+        
+        # 解析过期时间
+        try:
+            expire_datetime_str = parse_datetime(time_str)
+            expire_dt = datetime.datetime.strptime(expire_datetime_str, "%Y-%m-%d %H:%M")
+        except ValueError as e:
+            yield event.plain_result(f"时间格式错误：{str(e)}")
+            return
+        
+        # 检查过期时间是否在提醒时间之后（对于一次性提醒）
+        reminder = reminders[index - 1]
+        reminder_dt = datetime.datetime.strptime(reminder["datetime"], "%Y-%m-%d %H:%M")
+        
+        # 对于一次性提醒，过期时间应该在执行时间之前才有意义
+        # 对于重复提醒，过期时间表示在此之后停止重复
+        
+        # 获取实际的key
+        actual_key = self.star.compatibility_handler.get_actual_key(msg_origin)
+        
+        # 设置过期时间
+        reminder["expire_datetime"] = expire_datetime_str
+        
+        # 添加过期删除任务到调度器
+        expire_job_id = self.scheduler_manager.add_expire_job(actual_key, reminder, expire_dt, index - 1)
+        if expire_job_id:
+            reminder["expire_job_id"] = expire_job_id
+        
+        await save_reminder_data(self.data_file, self.reminder_data)
+        
+        is_command_task = reminder.get("is_command_task", False)
+        is_task = reminder.get("is_task", False)
+        
+        if is_command_task:
+            item_type = "指令任务"
+        elif is_task:
+            item_type = "任务"
+        else:
+            item_type = "提醒"
+        
+        yield event.plain_result(f"已为{item_type}「{reminder['text']}」设置过期时间：{expire_datetime_str}\n到期后将自动删除。")
 
+    @check_permission
+    async def remove_expire(self, event: AstrMessageEvent, index: int):
+        '''取消提醒或任务的过期时间设置
+        
+        Args:
+            index(int): 提醒或任务的序号
+        '''
+        # 获取用户ID，用于会话隔离
+        creator_id = event.get_sender_id()
+        
+        # 获取会话ID
+        raw_msg_origin = event.unified_msg_origin
+        if self.unique_session:
+            msg_origin = self.tools.get_session_id(raw_msg_origin, creator_id)
+        else:
+            msg_origin = raw_msg_origin
+            
+        # 使用兼容性处理器获取提醒列表
+        reminders = self.star.compatibility_handler.get_reminders(msg_origin)
+        if not reminders:
+            yield event.plain_result("没有设置任何提醒或任务。")
+            return
+            
+        if index < 1 or index > len(reminders):
+            yield event.plain_result("序号无效。")
+            return
+        
+        reminder = reminders[index - 1]
+        
+        if not reminder.get("expire_datetime"):
+            yield event.plain_result("该提醒或任务没有设置过期时间。")
+            return
+        
+        # 移除过期任务
+        if reminder.get("expire_job_id"):
+            try:
+                self.scheduler_manager.remove_job(reminder["expire_job_id"])
+            except Exception as e:
+                logger.warning(f"移除过期任务失败: {e}")
+        
+        # 清除过期时间
+        del reminder["expire_datetime"]
+        if "expire_job_id" in reminder:
+            del reminder["expire_job_id"]
+        
+        await save_reminder_data(self.data_file, self.reminder_data)
+        
+        is_command_task = reminder.get("is_command_task", False)
+        is_task = reminder.get("is_task", False)
+        
+        if is_command_task:
+            item_type = "指令任务"
+        elif is_task:
+            item_type = "任务"
+        else:
+            item_type = "提醒"
+        
+        yield event.plain_result(f"已取消{item_type}「{reminder['text']}」的过期时间设置。")
 
     @check_permission
     async def add_remote_reminder(self, event: AstrMessageEvent, group_id: str, text: str, time_str: str, week: str | None = None, repeat: str | None = None, holiday_type: str | None = None):
